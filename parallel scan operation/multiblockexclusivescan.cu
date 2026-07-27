@@ -1,0 +1,142 @@
+#include <device_launch_parameters.h>
+#include <iostream>
+#include <cuda_runtime.h>
+using namespace std;
+
+__global__ void multiblockupsweepscan(int* da, int* gblock, int N) {
+	extern __shared__ int smscan[];
+	int tid = threadIdx.x;
+	int gid = blockIdx.x * blockDim.x + tid;
+	int right, left;
+	if (gid < N) {
+		smscan[tid] = da[gid];
+	}
+	else {
+		smscan[tid] = 0;
+	}
+	__syncthreads();
+	//upsweep
+	for (int stride = 1; stride < blockDim.x; stride *= 2) {
+		right = (tid + 1) * (2 * stride) - 1;
+		left = right - stride;
+		if (right < blockDim.x) {
+			smscan[right] = smscan[right] + smscan[left];
+		}
+		__syncthreads();
+	}
+	if (tid == 0) {
+		gblock[blockIdx.x] = smscan[blockDim.x - 1];
+	}
+	//result set to 0
+	if (tid == 0)
+		smscan[blockDim.x - 1] = 0;
+	__syncthreads();
+	//downsweep
+	for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+		int idx = (tid + 1) * 2 * stride - 1;
+		if (idx < blockDim.x) {
+			int t = smscan[idx - stride];
+			smscan[idx - stride] = smscan[idx];
+			smscan[idx] += t;
+		}
+		__syncthreads();
+	}
+
+	// write exclusive result
+	if (gid < N)
+		da[gid] = smscan[tid];
+}
+
+__global__ void bellochscan(int* gblock, int N) {
+	extern __shared__ int smscan[];
+	int tid = threadIdx.x;
+	int right, left;
+	if (tid < N) {
+		smscan[tid] = gblock[tid];
+	}
+	__syncthreads();
+	for (int stride = 1; stride < blockDim.x; stride *= 2) {
+		right = (tid + 1) * (2 * stride) - 1;
+		left = right - stride;
+		if (right < N) {
+			smscan[right] = smscan[right] + smscan[left];
+		}
+		__syncthreads();
+	}
+	if (tid == 0) {
+		smscan[N - 1] = 0;
+	}
+	__syncthreads();
+
+	for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+		right = (tid + 1) * (2 * stride) - 1;
+		left = right - stride;
+		if (right < N) {
+			int t = smscan[left];
+			smscan[left] = smscan[right];
+			smscan[right] = smscan[right] + t;
+		}
+		__syncthreads();
+	}
+	if (tid < N) {
+		gblock[tid] = smscan[tid];
+	}
+	__syncthreads();
+
+}
+__global__ void addoffset(int* da, int* gblock, int N) {
+	int gid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (gid < N && blockIdx.x>0) {
+		da[gid] += gblock[blockIdx.x];
+	}
+
+}
+int main() {
+
+	int N = 128;
+	int* da;
+	int paddedN = 1;
+	while (paddedN < N) {
+		paddedN *= 2;
+	}
+	int* inputarr = new int[paddedN];
+	for (int i = 0; i < N; i++) {
+		inputarr[i] = rand() % 100;
+	}
+	for (int i = N; i < paddedN; i++) {
+		inputarr[i] = 0;
+	}
+	int* gblock, int* blocksum;
+	cudaMalloc(&da, paddedN * sizeof(int));
+	cudaMalloc(&blocksum, paddedN * sizeof(int));
+	cout << "INput array before exclusive";
+
+	for (int i = 0; i < N; i++) {
+		cout << inputarr[i] << " ";
+	}
+	cout << endl;
+	//block and thread sizes
+	int threadsPerBlock = 16; // or 512, etc.
+	int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+	cudaMalloc(&gblock, blocks * sizeof(int));
+	cudaMemcpy(da, inputarr, paddedN * sizeof(int), cudaMemcpyHostToDevice);
+	//step one: pre block scan
+	multiblockupsweepscan << <blocks, threadsPerBlock, sizeof(int)* threadsPerBlock >> > (da, gblock, N);
+	cudaMemcpy(blocksum, gblock, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+	//step 2://global exclusive scan
+	bellochscan << <1, blocks, sizeof(int)* blocks >> > (gblock, blocks);
+	//step3: addoffset to orignal global array
+	addoffset << <blocks, threadsPerBlock >> > (da, gblock, N);
+	cudaMemcpy(inputarr, da, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+	cout << "Exclusive Scan Result:\n";
+	for (int i = 0; i < N; i++)
+		cout << inputarr[i] << " ";
+	cout << endl;
+
+	cudaFree(da);
+	cudaFree(gblock);
+	delete[] inputarr;
+	return 0;
+}

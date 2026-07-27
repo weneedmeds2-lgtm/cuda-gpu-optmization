@@ -1,0 +1,371 @@
+#include <device_launch_parameters.h>
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+#include <cuda_runtime.h>
+
+using namespace std;
+
+__device__ int warpminmax(int val, bool ismax) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        int tmp = __shfl_down_sync(0xffffffff, val, offset);
+        if (ismax) {
+            if (tmp > val) val = tmp;
+        }
+        else {
+            if (tmp < val) val = tmp;
+        }
+    }
+    return val;
+}
+
+__global__ void rangenaive(int* input, int* blockmin, int* blockmax, int n) {
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (gid < n) {
+        int val = input[gid];
+        int start = blockIdx.x * blockDim.x;
+        int end = start + blockDim.x;
+        if (end > n) end = n;
+
+        int currentmin = val;
+        int currentmax = val;
+        for (int i = start; i < end; ++i) {
+            int comp = input[i];
+            if (comp < currentmin) currentmin = comp;
+            if (comp > currentmax) currentmax = comp;
+        }
+
+        if (threadIdx.x == 0) {
+            blockmin[blockIdx.x] = currentmin;
+            blockmax[blockIdx.x] = currentmax;
+        }
+    }
+}
+
+__global__ void rangesharedmemory(int* input, int* blockmin, int* blockmax, int n) {
+    extern __shared__ int smem[];
+    int* minrange = smem;
+    int* maxrange = smem + blockDim.x;
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (gid < n) {
+        minrange[tid] = input[gid];
+        maxrange[tid] = input[gid];
+    }
+    else {
+        minrange[tid] = INT_MAX;
+        maxrange[tid] = INT_MIN;
+    }
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+        if (tid < offset) {
+            if (minrange[tid + offset] < minrange[tid]) {
+                minrange[tid] = minrange[tid + offset];
+            }
+            if (maxrange[tid + offset] > maxrange[tid]) {
+                maxrange[tid] = maxrange[tid + offset];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        blockmin[blockIdx.x] = minrange[0];
+        blockmax[blockIdx.x] = maxrange[0];
+    }
+}
+
+__global__ void rangewarpoptimized(int* input, int* blockmin, int* blockmax, int n) {
+    extern __shared__ int smem[];
+    int* minshared = smem;
+    int* maxshared = smem + (blockDim.x / 32);
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    int lane = tid % 32;
+    int warpid = tid / 32;
+
+    int valmin = INT_MAX;
+    int valmax = INT_MIN;
+    if (gid < n) {
+        valmin = input[gid];
+        valmax = input[gid];
+    }
+
+    valmin = warpminmax(valmin, false);
+    valmax = warpminmax(valmax, true);
+
+    if (lane == 0) {
+        minshared[warpid] = valmin;
+        maxshared[warpid] = valmax;
+    }
+    __syncthreads();
+
+    if (warpid == 0) {
+        int numwarps = blockDim.x / 32;
+        int vmin = (tid < numwarps) ? minshared[tid] : INT_MAX;
+        int vmax = (tid < numwarps) ? maxshared[tid] : INT_MIN;
+
+        vmin = warpminmax(vmin, false);
+        vmax = warpminmax(vmax, true);
+
+        if (tid == 0) {
+            blockmin[blockIdx.x] = vmin;
+            blockmax[blockIdx.x] = vmax;
+        }
+    }
+}
+
+__global__ void globalrangereduce(int* blockmin, int* blockmax, int* outmin, int* outmax, int size) {
+    extern __shared__ int smem[];
+    int* minrange = smem;
+    int* maxrange = smem + blockDim.x;
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (gid < size) {
+        minrange[tid] = blockmin[gid];
+        maxrange[tid] = blockmax[gid];
+    }
+    else {
+        minrange[tid] = INT_MAX;
+        maxrange[tid] = INT_MIN;
+    }
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+        if (tid < offset) {
+            if (minrange[tid + offset] < minrange[tid]) {
+                minrange[tid] = minrange[tid + offset];
+            }
+            if (maxrange[tid + offset] > maxrange[tid]) {
+                maxrange[tid] = maxrange[tid + offset];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        outmin[blockIdx.x] = minrange[0];
+        outmax[blockIdx.x] = maxrange[0];
+    }
+}
+
+__global__ void histonaive(int* input, int* gbin, int n, int binsize, int maxval, int minval) {
+    int gid = threadIdx.x + blockDim.x * blockIdx.x;
+    int range = maxval - minval + 1;
+    int binwidth = range / binsize;
+    if (binwidth < 1) binwidth = 1;
+
+    if (gid < n) {
+        int binindex = (input[gid] - minval) / binwidth;
+        if (binindex >= binsize) binindex = binsize - 1;
+        atomicAdd(&gbin[binindex], 1);
+    }
+}
+
+__global__ void histosharedmemory(int* input, int* gbin, int n, int binsize, int maxval, int minval) {
+    extern __shared__ int smbin[];
+    int gid = threadIdx.x + blockDim.x * blockIdx.x;
+    int range = maxval - minval + 1;
+    int binwidth = range / binsize;
+    if (binwidth < 1) binwidth = 1;
+
+    for (int i = threadIdx.x; i < binsize; i += blockDim.x) {
+        smbin[i] = 0;
+    }
+    __syncthreads();
+
+    if (gid < n) {
+        int binindex = (input[gid] - minval) / binwidth;
+        if (binindex >= binsize) binindex = binsize - 1;
+        atomicAdd(&smbin[binindex], 1);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < binsize; i += blockDim.x) {
+        atomicAdd(&gbin[i], smbin[i]);
+    }
+}
+
+int main() {
+    int testsizes[3];
+    testsizes[0] = 1 << 15;
+    testsizes[1] = 1 << 18;
+    testsizes[2] = 1 << 20;
+
+    const int threadsperblock = 512;
+    const int binsize = 128;
+
+    for (int idx = 0; idx < 3; ++idx) {
+        int n = testsizes[idx];
+        int blockspergrid = (n + threadsperblock - 1) / threadsperblock;
+
+        cout << "\n============================================\n";
+        cout << "benchmarking histogram pipelines array size n = " << n << "\n";
+        cout << "============================================\n";
+
+        int* hostinput = new int[n];
+        int* hostbin = new int[binsize];
+
+        int cpumin = INT_MAX;
+        int cpumax = INT_MIN;
+        int* cpubin = new int[binsize];
+        for (int i = 0; i < binsize; ++i) {
+            cpubin[i] = 0;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            hostinput[i] = rand() % 500;
+            if (hostinput[i] < cpumin) cpumin = hostinput[i];
+            if (hostinput[i] > cpumax) cpumax = hostinput[i];
+        }
+
+        int cpurange = cpumax - cpumin + 1;
+        int cpubinwidth = cpurange / binsize;
+        if (cpubinwidth < 1) cpubinwidth = 1;
+        for (int i = 0; i < n; ++i) {
+            int bidx = (hostinput[i] - cpumin) / cpubinwidth;
+            if (bidx >= binsize) bidx = binsize - 1;
+            cpubin[bidx] = cpubin[bidx] + 1;
+        }
+
+        int* devicedata;
+        int* deviceblockmin;
+        int* deviceblockmax;
+        int* devicegbin;
+
+        cudaMalloc(&devicedata, n * sizeof(int));
+        cudaMalloc(&deviceblockmin, blockspergrid * sizeof(int));
+        cudaMalloc(&deviceblockmax, blockspergrid * sizeof(int));
+        cudaMalloc(&devicegbin, binsize * sizeof(int));
+
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        float milliseconds = 0;
+
+        int* d_inmin;
+        int* d_inmax;
+        int* d_outmin;
+        int* d_outmax;
+        cudaMalloc(&d_inmin, blockspergrid * sizeof(int));
+        cudaMalloc(&d_inmax, blockspergrid * sizeof(int));
+        cudaMalloc(&d_outmin, blockspergrid * sizeof(int));
+        cudaMalloc(&d_outmax, blockspergrid * sizeof(int));
+
+        // 1. Naive Pipeline
+        cudaMemcpy(devicedata, hostinput, n * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemset(devicegbin, 0, binsize * sizeof(int));
+
+        cudaEventRecord(start);
+        rangenaive << <blockspergrid, threadsperblock >> > (devicedata, deviceblockmin, deviceblockmax, n);
+
+        cudaMemcpy(d_inmin, deviceblockmin, blockspergrid * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_inmax, deviceblockmax, blockspergrid * sizeof(int), cudaMemcpyDeviceToDevice);
+        int currentsize = blockspergrid;
+        while (currentsize > 1) {
+            int needed = (currentsize + threadsperblock - 1) / threadsperblock;
+            globalrangereduce << <needed, threadsperblock, 2 * threadsperblock * sizeof(int) >> > (d_inmin, d_inmax, d_outmin, d_outmax, currentsize);
+            currentsize = needed;
+            std::swap(d_inmin, d_outmin);
+            std::swap(d_inmax, d_outmax);
+        }
+        int nmin, nmax;
+        cudaMemcpy(&nmin, d_inmin, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&nmax, d_inmax, sizeof(int), cudaMemcpyDeviceToHost);
+
+        histonaive << <blockspergrid, threadsperblock >> > (devicedata, devicegbin, n, binsize, nmax, nmin);
+        cudaEventRecord(stop);
+        cudaDeviceSynchronize();
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        cout << "naive strategy pipeline time: " << milliseconds * 1000.0f << " us\n";
+
+        // 2. Shared Memory Pipeline
+        cudaMemcpy(devicedata, hostinput, n * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemset(devicegbin, 0, binsize * sizeof(int));
+
+        cudaEventRecord(start);
+        rangesharedmemory << <blockspergrid, threadsperblock, 2 * threadsperblock * sizeof(int) >> > (devicedata, deviceblockmin, deviceblockmax, n);
+
+        cudaMemcpy(d_inmin, deviceblockmin, blockspergrid * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_inmax, deviceblockmax, blockspergrid * sizeof(int), cudaMemcpyDeviceToDevice);
+        currentsize = blockspergrid;
+        while (currentsize > 1) {
+            int needed = (currentsize + threadsperblock - 1) / threadsperblock;
+            globalrangereduce << <needed, threadsperblock, 2 * threadsperblock * sizeof(int) >> > (d_inmin, d_inmax, d_outmin, d_outmax, currentsize);
+            currentsize = needed;
+            std::swap(d_inmin, d_outmin);
+            std::swap(d_inmax, d_outmax);
+        }
+        int smmin, smmax;
+        cudaMemcpy(&smmin, d_inmin, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&smmax, d_inmax, sizeof(int), cudaMemcpyDeviceToHost);
+
+        histosharedmemory << <blockspergrid, threadsperblock, binsize * sizeof(int) >> > (devicedata, devicegbin, n, binsize, smmax, smmin);
+        cudaEventRecord(stop);
+        cudaDeviceSynchronize();
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        cout << "shared memory strategy pipeline time: " << milliseconds * 1000.0f << " us\n";
+
+        // 3. Warp Optimized Pipeline
+        cudaMemcpy(devicedata, hostinput, n * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemset(devicegbin, 0, binsize * sizeof(int));
+
+        cudaEventRecord(start);
+        int warpsperblock = threadsperblock / 32;
+        int warpsmbytes = 2 * warpsperblock * sizeof(int);
+        rangewarpoptimized << <blockspergrid, threadsperblock, warpsmbytes >> > (devicedata, deviceblockmin, deviceblockmax, n);
+
+        cudaMemcpy(d_inmin, deviceblockmin, blockspergrid * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_inmax, deviceblockmax, blockspergrid * sizeof(int), cudaMemcpyDeviceToDevice);
+        currentsize = blockspergrid;
+        while (currentsize > 1) {
+            int needed = (currentsize + threadsperblock - 1) / threadsperblock;
+            globalrangereduce << <needed, threadsperblock, 2 * threadsperblock * sizeof(int) >> > (d_inmin, d_inmax, d_outmin, d_outmax, currentsize);
+            currentsize = needed;
+            std::swap(d_inmin, d_outmin);
+            std::swap(d_inmax, d_outmax);
+        }
+        int warpminval, warpmaxval;
+        cudaMemcpy(&warpminval, d_inmin, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&warpmaxval, d_inmax, sizeof(int), cudaMemcpyDeviceToHost);
+
+        histosharedmemory << <blockspergrid, threadsperblock, binsize * sizeof(int) >> > (devicedata, devicegbin, n, binsize, warpmaxval, warpminval);
+        cudaEventRecord(stop);
+        cudaDeviceSynchronize();
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        cout << "warp optimized strategy pipeline time: " << milliseconds * 1000.0f << " us\n";
+
+        cudaMemcpy(hostbin, devicegbin, binsize * sizeof(int), cudaMemcpyDeviceToHost);
+        bool verified = true;
+        for (int i = 0; i < binsize; ++i) {
+            if (hostbin[i] != cpubin[i]) {
+                verified = false;
+                break;
+            }
+        }
+        if (verified) {
+            cout << "pipeline verification passed.\n";
+        }
+        else {
+            cout << "pipeline verification failed.\n";
+        }
+
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cudaFree(devicedata);
+        cudaFree(deviceblockmin);
+        cudaFree(deviceblockmax);
+        cudaFree(devicegbin);
+        cudaFree(d_inmin);
+        cudaFree(d_inmax);
+        cudaFree(d_outmin);
+        cudaFree(d_outmax);
+        delete[] hostinput;
+        delete[] hostbin;
+        delete[] cpubin;
+    }
+    return 0;
+}

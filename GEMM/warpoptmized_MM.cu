@@ -1,0 +1,67 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <iostream>
+#include <vector>
+
+using namespace std;
+
+#define TILE_SIZE 32
+
+__global__ void transpose(float* matrix_b, int N, float* matrixbt) {
+    __shared__ float tile[TILE_SIZE][TILE_SIZE];
+    int globalrow = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int globalcol = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    if (globalrow < N && globalcol < N) {
+        tile[threadIdx.y][threadIdx.x] = matrix_b[globalrow * N + globalcol];
+    }
+    __syncthreads();
+
+    int trow = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tcol = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    if (trow < N && tcol < N) {
+        matrixbt[tcol * N + trow] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
+__global__ void matrix_multiply_optimized_kernel(float* matrix_a, float* matrix_bt, float* matrix_c, int N) {
+    __shared__ float sa[TILE_SIZE][TILE_SIZE];
+    __shared__ float sb[TILE_SIZE][TILE_SIZE];
+
+    int globalrow = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int globalcol = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int k = 0; k < N; k += TILE_SIZE) {
+        // Coalesced load of Matrix A
+        if (globalrow < N && (k + threadIdx.x) < N) {
+            sa[threadIdx.y][threadIdx.x] = matrix_a[globalrow * N + (k + threadIdx.x)];
+        }
+        else {
+            sa[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // Coalesced load of Transposed Matrix B (d_bt)
+        // Since B is transposed, rows of B_T are columns of B.
+        if (globalcol < N && (k + threadIdx.y) < N) {
+            sb[threadIdx.y][threadIdx.x] = matrix_bt[globalcol * N + (k + threadIdx.y)];
+        }
+        else {
+            sb[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute step (Conflict-free shared memory access)
+#pragma unroll
+        for (int offset = 0; offset < TILE_SIZE; offset++) {
+            sum += sa[threadIdx.y][offset] * sb[offset][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (globalrow < N && globalcol < N) {
+        matrix_c[globalrow * N + globalcol] = sum;
+    }
+}

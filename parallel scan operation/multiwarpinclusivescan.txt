@@ -1,0 +1,163 @@
+#include <device_launch_parameters.h>
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cstdlib>
+
+using namespace std;
+
+__global__ void multiblock_inclusive_warp(int* da, int* gblock, int N) {
+    // Shared memory allocated dynamically only to store the aggregate sums of each warp
+    extern __shared__ int warp_sums[]; 
+    
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + tid;
+    int warpid = tid / 32;
+    int laneid = tid % 32;
+
+    int val = 0;
+    if (gid < N) {
+        val = da[gid];
+    }
+
+    unsigned mask = 0xffffffff;
+
+    // 1. Parallel Warp-level inclusive scan using register shuffle exchanges
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        int n = __shfl_up_sync(mask, val, offset);
+        if (laneid >= offset) {
+            val += n;
+        }
+    }
+
+    // 2. The last lane of each warp writes its aggregate summary sum to shared storage
+    if (laneid == 31) {
+        warp_sums[warpid] = val;
+    }
+    __syncthreads();
+
+    // 3. The first warp scans the collected warp aggregates array 
+    if (warpid == 0) {
+        int warpVal = 0;
+        int warpCount = (blockDim.x + 31) / 32;
+
+        if (laneid < warpCount) {
+            warpVal = warp_sums[laneid];
+        }
+
+        // Warp inclusive scan across warp aggregates
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            int n = __shfl_up_sync(mask, warpVal, offset);
+            if (laneid >= offset) {
+                warpVal += n;
+            }
+        }
+
+        if (laneid < warpCount) {
+            warp_sums[laneid] = warpVal;
+        }
+    }
+    __syncthreads();
+
+    // 4. Uniformly accumulate the prefix boundary scans from previous warps
+    if (warpid > 0) {
+        val += warp_sums[warpid - 1];
+    }
+    __syncthreads();
+
+    // 5. Track the final overall block sum and assign block tracking summaries
+    if (tid == blockDim.x - 1) {
+        gblock[blockIdx.x] = val;
+    }
+
+    // Write complete Inclusive result down into global destination
+    if (gid < N) {
+        da[gid] = val;
+    }
+}
+
+// Global exclusive scan across block summaries array
+__global__ void belloch_exclusive_scan(int* gblock, int N) {
+    extern __shared__ int smscan[];
+    int tid = threadIdx.x;
+    int right, left;
+    
+    if (tid < N) {
+        smscan[tid] = gblock[tid];
+    } else {
+        smscan[tid] = 0;
+    }
+    __syncthreads();
+    
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        right = (tid + 1) * (2 * stride) - 1;
+        left = right - stride;
+        if (right < blockDim.x) {
+            smscan[right] += smscan[left];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        smscan[blockDim.x - 1] = 0;
+    }
+    __syncthreads();
+      
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        right = (tid + 1) * (2 * stride) - 1;
+        left = right - stride;
+        if (right < blockDim.x) {
+            int t = smscan[left];
+            smscan[left] = smscan[right];
+            smscan[right] += t;
+        }
+        __syncthreads();
+    }
+
+    if (tid < N) {
+        gblock[tid] = smscan[tid];
+    }
+}
+
+__global__ void addoffset(int* da, int* gblock, int N) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < N && blockIdx.x > 0) {
+        da[gid] += gblock[blockIdx.x];
+    }
+}
+
+int main() {
+    int N = 1024; // Expanded array bounds to easily highlight multi-warp coordination
+    int paddedN = 1;
+    while (paddedN < N) paddedN *= 2;
+    
+    int* inputarr = new int[paddedN];
+    for (int i = 0; i < N; i++) inputarr[i] = 1; // Initializing to 1 for easy terminal confirmation
+    for (int i = N; i < paddedN; i++) inputarr[i] = 0;
+    
+    int *da, *gblock;
+    cudaMalloc(&da, paddedN * sizeof(int));
+    
+    int threadsPerBlock = 256; // Must be a multiple of 32 for warp primitives
+    int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+    cudaMalloc(&gblock, blocks * sizeof(int));
+    
+    cudaMemcpy(da, inputarr, paddedN * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Compute dynamic shared memory sizing allocation required for holding warp summaries
+    int sharedMemSize = sizeof(int) * ((threadsPerBlock + 31) / 32);
+
+    multiblock_inclusive_warp<<<blocks, threadsPerBlock, sharedMemSize>>>(da, gblock, N);
+    belloch_exclusive_scan<<<1, threadsPerBlock, sizeof(int) * threadsPerBlock>>>(gblock, blocks);
+    addoffset<<<blocks, threadsPerBlock>>>(da, gblock, N);
+    
+    cudaMemcpy(inputarr, da, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    cout << "Warp Optimized Inclusive Scan Result (First 50 elements):\n";
+    for (int i = 0; i < 50; i++) cout << inputarr[i] << " ";
+    cout << "\n...\n";
+    cout << "Last element (Expected: " << N << "): " << inputarr[N - 1] << endl;
+
+    cudaFree(da); cudaFree(gblock);
+    delete[] inputarr;
+    return 0;
+}

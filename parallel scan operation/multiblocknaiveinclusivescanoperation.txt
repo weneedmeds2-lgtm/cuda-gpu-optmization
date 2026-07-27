@@ -1,0 +1,173 @@
+#include <device_launch_parameters.h>
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cstdlib> // For rand()
+
+using namespace std;
+
+__global__ void multiblock_inclusive_upsweep(int* da, int *gblock, int N) {
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + tid;
+    int right, left;
+
+    // 1. Blelloch Upsweep (Reduction Tree)
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        right = (tid + 1) * (2 * stride) - 1;
+        left = right - stride;
+        
+        int g_right = blockIdx.x * blockDim.x + right;
+        int g_left = blockIdx.x * blockDim.x + left;
+
+        if (right < blockDim.x && g_right < N) {
+            da[g_right] = da[g_right] + (g_left < N ? da[g_left] : 0);
+        }
+        __syncthreads();
+    }
+
+    // 2. Extract total block sum BEFORE downsweep transforms the array
+    if (tid == 0) {
+        int g_last = blockIdx.x * blockDim.x + (blockDim.x - 1);
+        gblock[blockIdx.x] = (g_last < N) ? da[g_last] : 0;
+    }
+    __syncthreads();
+
+    // 3. Save the original block reduction state to reconstruct inclusive scan
+    // We cache what is currently at g_last before zeroing it out
+    int g_last_idx = blockIdx.x * blockDim.x + (blockDim.x - 1);
+    int total_block_sum = (g_last_idx < N) ? da[g_last_idx] : 0;
+
+    if (tid == 0 && g_last_idx < N) {
+        da[g_last_idx] = 0; // Set to identity for the exclusive downsweep phase
+    }
+    __syncthreads();
+
+    // 4. Blelloch Downsweep Phase (Generates an intermediate Exclusive Scan locally)
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        int idx = (tid + 1) * 2 * stride - 1;
+        int g_idx = blockIdx.x * blockDim.x + idx;
+        int g_left = g_idx - stride;
+
+        if (idx < blockDim.x && g_idx < N) {
+            int t = da[g_left];
+            da[g_left] = da[g_idx];
+            da[g_idx] += t;
+        }
+        __syncthreads();
+    }
+
+    // 5. Transform Local Exclusive Scan into an Inclusive Scan
+    // Shift left by 1 element, and put the total block sum at the end.
+    // To avoid data overwrites, we pull values based on a logical mapping.
+    int current_exclusive_val = (gid < N) ? da[gid] : 0;
+    __syncthreads(); 
+
+    if (gid < N) {
+        // If it's the last element of the block, it gets the total block sum
+        if (tid == blockDim.x - 1) {
+            da[gid] = total_block_sum;
+        } else if (gid + 1 < N) {
+            // Otherwise, read the next thread's exclusive value to become this thread's inclusive value
+            // We use a temporary assignment or rely on the sync above, but since we are modifying 
+            // the array inline, a safer approach is referencing the global array after synchronization.
+            // For a robust global-memory inline shift:
+            da[gid] = da[gid + 1]; 
+        }
+    }
+    
+    // Quick patch for the element just before the block boundary edge
+    __syncthreads();
+    if (gid < N && tid == blockDim.x - 1) {
+        da[gid] = total_block_sum;
+    }
+}
+
+// Computes an EXCLUSIVE scan on the block summaries array
+__global__ void belloch_exclusive_scan(int* gblock, int N) {
+    int tid = threadIdx.x;
+    int right, left;
+    
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        right = (tid + 1) * (2 * stride) - 1;
+        left = right - stride;
+        if (right < N) {
+            gblock[right] = gblock[right] + gblock[left];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0 && N > 0) {
+        gblock[N - 1] = 0;
+    }
+    __syncthreads();
+      
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        right = (tid + 1) * (2 * stride) - 1;
+        left = right - stride;
+        if (right < N) {
+            int t = gblock[left];
+            gblock[left] = gblock[right];
+            gblock[right] = gblock[right] + t;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void addoffset(int* da, int* gblock, int N) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < N && blockIdx.x > 0) {
+        da[gid] += gblock[blockIdx.x];
+    }
+}
+
+int main() {
+    int N = 128;
+    int* da;
+    int paddedN = 1;
+    while (paddedN < N) {
+        paddedN *= 2;
+    }
+    
+    int* inputarr = new int[paddedN];
+    for (int i = 0; i < N; i++) {
+        inputarr[i] = rand() % 10; 
+    }
+    for (int i = N; i < paddedN; i++) {
+        inputarr[i] = 0;
+    }
+    
+    int *gblock; 
+    cudaMalloc(&da, paddedN * sizeof(int));
+    
+    int threadsPerBlock = 16; 
+    int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+    
+    cout << "Input array before inclusive scan:\n";
+    for (int i = 0; i < N; i++) {
+        cout << inputarr[i] << " ";
+    }
+    cout << "\n\n";
+
+    cudaMalloc(&gblock, blocks * sizeof(int));
+    cudaMemcpy(da, inputarr, paddedN * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Step 1: Independent Local Block Inclusive Scans
+    multiblock_inclusive_upsweep<<<blocks, threadsPerBlock>>>(da, gblock, N);
+
+    // Step 2: Global EXCLUSIVE scan across block summaries to establish offsets
+    belloch_exclusive_scan<<<1, threadsPerBlock>>>(gblock, blocks);
+    
+    // Step 3: Add offsets back uniformly
+    addoffset<<<blocks, threadsPerBlock>>>(da, gblock, N);
+    
+    cudaMemcpy(inputarr, da, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    cout << "Inclusive Scan Result:\n";
+    for (int i = 0; i < N; i++)
+        cout << inputarr[i] << " ";
+    cout << endl;
+
+    cudaFree(da);
+    cudaFree(gblock);
+    delete[] inputarr;
+    return 0;
+}

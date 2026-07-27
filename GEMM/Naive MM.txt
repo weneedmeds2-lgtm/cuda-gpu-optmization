@@ -1,0 +1,136 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <iostream>
+#include <vector>
+#include <iomanip>
+
+using namespace std;
+
+// -----------------------------------------------------------------------------
+// KERNEL 1: Naive Global Memory GEMM
+// -----------------------------------------------------------------------------
+__global__ void matrix_multiply_naive_kernel(const float* A, const float* B, float* C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < N; k++) {
+            sum += A[row * N + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// BENCHMARK REPORTER
+// -----------------------------------------------------------------------------
+void print_benchmark_metrics(
+    const char* kernel_name,
+    void (*kernel_func)(const float*, const float*, float*, int),
+    dim3 grid,
+    dim3 block,
+    size_t shared_mem_bytes,
+    float* d_a,
+    float* d_b,
+    float* d_c,
+    int N
+) {
+    // 1. Hardware Occupancy Query
+    int max_active_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, kernel_func, block.x * block.y, shared_mem_bytes);
+
+    cudaDeviceProp prop;
+    cudaGetDevice(0);
+    cudaGetDeviceProperties(&prop, 0);
+
+    int max_warps_per_sm = prop.maxThreadsPerMultiProcessor / prop.warpSize;
+    int active_warps_per_sm = max_active_blocks * ((block.x * block.y) / prop.warpSize);
+    float theoretical_occupancy = ((float)active_warps_per_sm / (float)max_warps_per_sm) * 100.0f;
+
+    // 2. Timing Run
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Warm-up
+    kernel_func<<<grid, block, shared_mem_bytes>>>(d_a, d_b, d_c, N);
+    cudaDeviceSynchronize();
+
+    // Timed execution
+    cudaEventRecord(start);
+    kernel_func<<<grid, block, shared_mem_bytes>>>(d_a, d_b, d_c, N);
+    cudaEventRecord(stop);
+    cudaDeviceSynchronize();
+
+    float milliseconds = 0.0f;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    // 3. Compute Metrics
+    double total_elements = (double)N * N;
+    double matrix_mb = (total_elements * sizeof(float)) / (1024.0 * 1024.0);
+    
+    double total_gflops = (2.0 * N * N * N) / 1e9;
+    double achieved_gflops = total_gflops / (milliseconds / 1000.0);
+
+    double bytes_transferred = 3.0 * total_elements * sizeof(float);
+    double effective_bandwidth_gbps = (bytes_transferred / 1e9) / (milliseconds / 1000.0);
+
+    // 4. Formatted Output Print
+    cout << "============================================" << endl;
+    cout << "CUDA GEMM Benchmark: " << kernel_name << endl;
+    cout << "============================================" << endl;
+    cout << left << setw(24) << "Matrix Dimensions"    << ": " << N << " x " << N << endl;
+    cout << left << setw(24) << "Total Elements"       << ": " << (long long)total_elements << " elements" << endl;
+    cout << left << setw(24) << "Matrix Memory Size"   << ": " << fixed << setprecision(2) << matrix_mb << " MB" << endl;
+    cout << left << setw(24) << "Threads Per Block"    << ": " << block.x * block.y << " (" << block.x << "x" << block.y << ")" << endl;
+    cout << left << setw(24) << "Blocks Per Grid"      << ": " << grid.x * grid.y << " (" << grid.x << "x" << grid.y << ")" << endl;
+    cout << left << setw(24) << "Shared Memory/Block"  << ": " << shared_mem_bytes << " Bytes (" << (float)shared_mem_bytes / 1024.0f << " KB)" << endl;
+    cout << "--------------------------------------------" << endl;
+    cout << left << setw(24) << "Execution Time"       << ": " << setprecision(4) << milliseconds << " ms" << endl;
+    cout << left << setw(24) << "Performance Rate"     << ": " << setprecision(2) << achieved_gflops << " GFLOPS" << endl;
+    cout << left << setw(24) << "Effective Bandwidth"  << ": " << setprecision(2) << effective_bandwidth_gbps << " GB/s" << endl;
+    cout << left << setw(24) << "Theoretical Occupancy"<< ": " << setprecision(1) << theoretical_occupancy << " %" << endl;
+    cout << "============================================" << endl;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
+// -----------------------------------------------------------------------------
+// MAIN DRIVER
+// -----------------------------------------------------------------------------
+int main() {
+    int N = 1024;
+    size_t matrix_bytes = N * N * sizeof(float);
+
+    vector<float> h_a(N * N, 1.0f);
+    vector<float> h_b(N * N, 2.0f);
+    vector<float> h_c(N * N, 0.0f);
+
+    float *d_a, *d_b, *d_c;
+    cudaMalloc(&d_a, matrix_bytes);
+    cudaMalloc(&d_b, matrix_bytes);
+    cudaMalloc(&d_c, matrix_bytes);
+
+    cudaMemcpy(d_a, h_a.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b.data(), matrix_bytes, cudaMemcpyHostToDevice);
+
+    dim3 block_dim(16, 16);
+    dim3 grid_dim((N + block_dim.x - 1) / block_dim.x, (N + block_dim.y - 1) / block_dim.y);
+
+    print_benchmark_metrics(
+        "Naive Global Memory",
+        matrix_multiply_naive_kernel,
+        grid_dim,
+        block_dim,
+        0, // 0 bytes shared memory
+        d_a, d_b, d_c, N
+    );
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+
+    return 0;
+}

@@ -1,0 +1,123 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <iostream>
+#include <vector>
+
+using namespace std;
+
+#define TILE_SIZE 16
+__global__ void transpose(float* matrix_b, int N, float* matrixbt) {
+    __shared__ float tile[TILE_SIZE][TILE_SIZE];
+    int globalrow = blockIdx.y * TILE_SIZE + threadIdx.y*2;
+    int globalcol = blockIdx.x * TILE_SIZE + threadIdx.x*2;
+
+    // Load into shared memory
+    if (globalrow < N && globalcol < N) {
+        tile[threadIdx.y][threadIdx.x] = matrix_b[globalrow * N + globalcol];
+    }
+    __syncthreads();
+
+    // Transpose indices
+    int trow = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tcol = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    if (trow < N && tcol < N) {
+        matrixbt[tcol * N + trow] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+  
+// This is your new "Canvas" for Warp-Level Optimizations
+__global__ void matrix_multiply_warp_level_kernel(float* matrix_a, float* matrix_b, float* matrix_c, int N) {
+    __shared__ float sa[TILE_SIZE][TILE_SIZE];
+    __shared__ float sb[TILE_SIZE][TILE_SIZE];
+    int globalrow = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int globalcol = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum[2][2] = {0.0f};
+
+    for (int k = 0; k < N; k += TILE_SIZE) {
+        if (globalrow < N && (k + threadIdx.x) < N) {
+            sa[threadIdx.y][threadIdx.x] = matrix_a[globalrow * N + (k + threadIdx.x)];
+        }
+        else {
+            sa[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        if (globalcol < N && (k + threadIdx.y) < N) {
+            sb[threadIdx.y][threadIdx.x] = matrix_b[(k + threadIdx.y) * N + globalcol];
+        }
+        else {
+            sb[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+        //warp level execution for computing 
+#pragma unroll
+        for (int offset = 0; offset < TILE_SIZE; offset++) {
+            float valA = __shfl_sync(0xffffffff, sa[threadIdx.y][offset], offset);
+
+            // Multiply against B columns
+            sum[0][0] += valA * sb[offset][threadIdx.x];
+            sum[0][1] += valA * sb[offset][threadIdx.x + 1]; // Neighbor column
+            sum[1][0] += valA * sb[offset + 1][threadIdx.x]; // Neighbor row
+            sum[1][1] += valA * sb[offset + 1][threadIdx.x + 1];
+        }
+        __syncthreads();
+    }
+
+    if (globalrow < N && globalcol < N) {
+        matrix_c[globalrow * N + globalcol] = sum[0][0];
+        if (globalcol + 16 < N) matrix_c[globalrow * N + globalcol + 16] = sum[0][1];
+        if (globalrow + 16 < N) matrix_c[(globalrow + 16) * N + globalcol] = sum[1][0];
+        if (globalrow + 16 < N && globalcol + 16 < N) matrix_c[(globalrow + 16) * N + globalcol + 16] = sum[1][1];
+    }
+}
+int main() {
+    vector<int> test_sizes = { 512, 1024, 2048 };
+
+    for (int N : test_sizes) {
+        cout << "\n============================================\n";
+        cout << "Benchmarking Matrix Dimension: " << N << " x " << N << "\n";
+        cout << "============================================\n";
+
+        size_t matrix_bytes = N * N * sizeof(float);
+        vector<float> h_a(N * N, 1.0f), h_b(N * N, 1.0f), h_my_c(N * N);
+
+        float* d_a, * d_b, * d_c, * d_bt;
+        cudaMalloc(&d_a, matrix_bytes);
+        cudaMalloc(&d_b, matrix_bytes);
+        cudaMalloc(&d_c, matrix_bytes);
+        cudaMalloc(&d_bt, matrix_bytes);
+
+        cudaMemcpy(d_a, h_a.data(), matrix_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_b, h_b.data(), matrix_bytes, cudaMemcpyHostToDevice);
+
+        dim3 block_dim(TILE_SIZE, TILE_SIZE);
+        dim3 grid_dim((N + TILE_SIZE - 1) / TILE_SIZE, (N + TILE_SIZE - 1) / TILE_SIZE);
+
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start); cudaEventCreate(&stop);
+
+        // 1. Transpose Matrix B
+        transpose << <grid_dim, block_dim >> > (d_b, N, d_bt);
+        cudaDeviceSynchronize();
+
+        // 2. Benchmark Multiplication using Transposed B (d_bt)
+        cudaEventRecord(start);
+        matrix_multiply_warp_level_kernel << <grid_dim, block_dim >> > (d_a, d_bt, d_c, N);
+        cudaEventRecord(stop);
+        cudaDeviceSynchronize();
+
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+
+        double gflops = (2.0 * N * N * N) / (milliseconds / 1000.0) / 1e9;
+        cout << "[-] Time: " << milliseconds << " ms" << endl;
+        cout << "[-] Performance: " << gflops << " GFLOPS" << endl;
+
+        cudaMemcpy(h_my_c.data(), d_c, matrix_bytes, cudaMemcpyDeviceToHost);
+
+        cudaFree(d_a); cudaFree(d_b); cudaFree(d_c); cudaFree(d_bt);
+        cudaEventDestroy(start); cudaEventDestroy(stop);
+    }
+    return 0;
+}
+
